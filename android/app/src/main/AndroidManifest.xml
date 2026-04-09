@@ -1,6 +1,6 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application
-        android:label="face_recognition"
+        android:label="A_face_recognition"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity
