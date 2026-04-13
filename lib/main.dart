@@ -7,7 +7,7 @@ import 'package:face_recognition/detector_painters.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import 'package:flutter_face_mesh/flutter_face_mesh.dart' as ffm;
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 import 'package:tflite_flutter/tflite_flutter.dart' as tfl;
@@ -214,7 +214,7 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
   List<CameraDescription> _cameras = [];
   CameraLensDirection _direction = CameraLensDirection.front;
 
-  FaceDetector? _faceDetector;
+  ffm.FaceDetector? _faceDetector;
   tfl.Interpreter? _interpreter;
 
   Directory? _appDir;
@@ -231,7 +231,7 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
   int _lastPipelineMs = 0; // how long the last full pipeline took
   int _skipsRemaining = 0; // adaptive-skip countdown
 
-  Map<String, List<Face>> _scanResults = {};
+  Map<String, List<ffm.Face>> _scanResults = {};
   Map<String, List<double>> _savedEmbeddings = {};
   List<double>? _currentEmbedding;
 
@@ -252,15 +252,8 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
       _cameras = await availableCameras();
       if (_cameras.isEmpty) throw Exception('No cameras found.');
 
-      _faceDetector = FaceDetector(
-        options: FaceDetectorOptions(
-          performanceMode: FaceDetectorMode.fast,
-          enableLandmarks: false,
-          enableClassification: false,
-          enableContours: false,
-          enableTracking: false,
-        ),
-      );
+      _faceDetector = ffm.FaceDetector();
+      await _faceDetector!.initialize(maxFaces: 5);
 
       try {
         await _loadModel();
@@ -422,11 +415,20 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
     // Stopwatches are compiled out in release builds via _Log.measure().
     final totalSw = kDebugMode ? (Stopwatch()..start()) : null;
 
-    final inputImage = _inputImageFromCameraImage(image, controller);
-    if (inputImage == null) return;
+    final int rotation = _calculateRotation(controller);
+    final String format = Platform.isAndroid ? 'nv21' : 'jpeg';
 
     final detectionSw = kDebugMode ? (Stopwatch()..start()) : null;
-    final faces = await _faceDetector!.processImage(inputImage);
+
+    // For ffm, we pass the raw bytes from the first plane (NV21/BGRA)
+    final ffm.FaceResult faceResult = await _faceDetector!.detectFromBytes(
+      bytes: image.planes.first.bytes,
+      width: image.width,
+      height: image.height,
+      rotation: rotation,
+      format: format,
+    );
+    final faces = faceResult.faces;
     detectionSw?.stop();
 
     if (faces.isEmpty) {
@@ -451,11 +453,16 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
     conversionSw?.stop();
 
     final recognitionSw = kDebugMode ? (Stopwatch()..start()) : null;
-    final Map<String, List<Face>> finalResults = {};
+    final Map<String, List<ffm.Face>> finalResults = {};
 
     for (final face in faces) {
+      // ffm bounding box is normalized [0, 1]. Convert to pixel space of the convertedImage.
+      final pixelRect = face.boundingBox.toRect(
+        Size(convertedImage.width.toDouble(), convertedImage.height.toDouble()),
+      );
+
       final safeRect = _expandedRect(
-        face.boundingBox,
+        pixelRect,
         convertedImage.width,
         convertedImage.height,
       );
@@ -499,7 +506,10 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
 
   /// Shallow equality check to avoid redundant repaints when faces/labels
   /// haven't changed between frames.
-  bool _mapsEqual(Map<String, List<Face>> a, Map<String, List<Face>> b) {
+  bool _mapsEqual(
+    Map<String, List<ffm.Face>> a,
+    Map<String, List<ffm.Face>> b,
+  ) {
     if (a.length != b.length) return false;
     for (final key in a.keys) {
       if (!b.containsKey(key)) return false;
@@ -508,57 +518,14 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
     return true;
   }
 
-  InputImage? _inputImageFromCameraImage(
-    CameraImage image,
-    CameraController controller,
-  ) {
+  int _calculateRotation(CameraController controller) {
     final camera = controller.description;
     final sensorOrientation = camera.sensorOrientation;
+    final comp = _orientations[controller.value.deviceOrientation] ?? 0;
 
-    InputImageRotation? rotation;
-    if (Platform.isIOS) {
-      rotation = InputImageRotationValue.fromRawValue(sensorOrientation);
-    } else if (Platform.isAndroid) {
-      final comp = _orientations[controller.value.deviceOrientation];
-      if (comp == null) return null;
-      final adjusted = camera.lensDirection == CameraLensDirection.front
-          ? (sensorOrientation + comp) % 360
-          : (sensorOrientation - comp + 360) % 360;
-      rotation = InputImageRotationValue.fromRawValue(adjusted);
-    }
-    if (rotation == null) return null;
-
-    final format = InputImageFormatValue.fromRawValue(image.format.raw);
-    if (format == null) return null;
-
-    // Single-plane fast path (NV21 packed / BGRA).
-    if (image.planes.length == 1) {
-      return InputImage.fromBytes(
-        bytes: image.planes.first.bytes,
-        metadata: InputImageMetadata(
-          size: Size(image.width.toDouble(), image.height.toDouble()),
-          rotation: rotation,
-          format: format,
-          bytesPerRow: image.planes.first.bytesPerRow,
-        ),
-      );
-    }
-
-    // Multi-plane path: concatenate planes.
-    final allBytes = WriteBuffer();
-    for (final plane in image.planes) {
-      allBytes.putUint8List(plane.bytes);
-    }
-
-    return InputImage.fromBytes(
-      bytes: allBytes.done().buffer.asUint8List(),
-      metadata: InputImageMetadata(
-        size: Size(image.width.toDouble(), image.height.toDouble()),
-        rotation: rotation,
-        format: format,
-        bytesPerRow: image.planes.first.bytesPerRow,
-      ),
-    );
+    return camera.lensDirection == CameraLensDirection.front
+        ? (sensorOrientation + comp) % 360
+        : (sensorOrientation - comp + 360) % 360;
   }
 
   String _recognize(img.Image faceImage) {
@@ -756,7 +723,7 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
   void dispose() {
     _nameController.dispose();
     _stopCamera();
-    _faceDetector?.close();
+    _faceDetector?.dispose();
     _interpreter?.close();
     SystemChrome.setPreferredOrientations(DeviceOrientation.values);
     super.dispose();

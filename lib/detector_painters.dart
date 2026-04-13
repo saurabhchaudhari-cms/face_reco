@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import 'package:flutter_face_mesh/flutter_face_mesh.dart' as ffm;
 
 class FaceDetectorPainter extends CustomPainter {
   FaceDetectorPainter({
@@ -9,7 +9,7 @@ class FaceDetectorPainter extends CustomPainter {
   });
 
   final Size imageSize;
-  final Map<String, List<Face>> results;
+  final Map<String, List<ffm.Face>> results;
   final bool isFrontCamera;
 
   @override
@@ -24,9 +24,11 @@ class FaceDetectorPainter extends CustomPainter {
     final double scaleX = size.width / imageSize.width;
     final double scaleY = size.height / imageSize.height;
 
-    results.forEach((String label, List<Face> faces) {
-      for (final Face face in faces) {
-        final Rect rect = face.boundingBox;
+    results.forEach((String label, List<ffm.Face> faces) {
+      for (final ffm.Face face in faces) {
+        // The bounding box from ffm is normalized [0, 1] relative to the image.
+        // Convert it to pixel space relative to imageSize first.
+        final Rect rect = face.boundingBox.toRect(imageSize);
 
         final double left = isFrontCamera
             ? size.width - (rect.right * scaleX)
