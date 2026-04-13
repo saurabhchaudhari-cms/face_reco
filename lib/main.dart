@@ -10,6 +10,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_face_mesh/flutter_face_mesh.dart' as ffm;
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:tflite_flutter/tflite_flutter.dart' as tfl;
 
 import 'utils.dart';
@@ -165,6 +166,53 @@ img.Image _decodeYUV(_RawCameraFrame frame) {
   return result;
 }
 
+Uint8List _buildNV21Bytes(CameraImage image) {
+  final w = image.width;
+  final h = image.height;
+  final ySize = w * h;
+  final uvSize = (w * h / 2).floor();
+  final nv21 = Uint8List(ySize + uvSize);
+
+  // Plane 0 is always Y
+  final yPlane = image.planes[0].bytes;
+  final yRowStride = image.planes[0].bytesPerRow;
+
+  for (int y = 0; y < h; y++) {
+    for (int x = 0; x < w; x++) {
+      nv21[y * w + x] = yPlane[y * yRowStride + x];
+    }
+  }
+
+  // UV planes handling
+  if (image.planes.length >= 3) {
+    // Standard 3-plane YUV420_888
+    final uPlane = image.planes[1].bytes;
+    final vPlane = image.planes[2].bytes;
+    final uvRowStride = image.planes[1].bytesPerRow;
+    final uvPixelStride = image.planes[1].bytesPerPixel ?? 1;
+
+    for (int y = 0; y < (h / 2).floor(); y++) {
+      for (int x = 0; x < (w / 2).floor(); x++) {
+        final uvIdx = y * uvRowStride + x * uvPixelStride;
+        final outIdx = ySize + y * w + x * 2;
+        nv21[outIdx] = vPlane[uvIdx];
+        nv21[outIdx + 1] = uPlane[uvIdx];
+      }
+    }
+  } else if (image.planes.length == 2) {
+    // 2-plane (often Y + VU interleaved)
+    final vuPlane = image.planes[1].bytes;
+    final vuRowStride = image.planes[1].bytesPerRow;
+    for (int y = 0; y < (h / 2).floor(); y++) {
+      for (int x = 0; x < w; x++) {
+        nv21[ySize + y * w + x] = vuPlane[y * vuRowStride + x];
+      }
+    }
+  }
+
+  return nv21;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 Future<void> main() async {
@@ -249,11 +297,19 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
 
   Future<void> _initialize() async {
     try {
+      if (Platform.isAndroid) {
+        final status = await Permission.camera.request();
+        if (!status.isGranted) throw Exception('Camera permission denied.');
+      }
+
       _cameras = await availableCameras();
       if (_cameras.isEmpty) throw Exception('No cameras found.');
 
       _faceDetector = ffm.FaceDetector();
-      await _faceDetector!.initialize(maxFaces: 5);
+      await _faceDetector!.initialize(
+        modelAsset: 'packages/flutter_face_mesh/assets/face_landmarker.task',
+        maxFaces: 5,
+      );
 
       try {
         await _loadModel();
@@ -316,6 +372,11 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
         (c) => c.lensDirection == _direction,
         orElse: () => _cameras.first,
       );
+
+      if (Platform.isAndroid) {
+        final status = await Permission.camera.request();
+        if (!status.isGranted) return;
+      }
 
       await _stopCamera();
 
@@ -420,9 +481,9 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
 
     final detectionSw = kDebugMode ? (Stopwatch()..start()) : null;
 
-    // For ffm, we pass the raw bytes from the first plane (NV21/BGRA)
+    // For ffm, we pass the correctly packed NV21 bytes
     final ffm.FaceResult faceResult = await _faceDetector!.detectFromBytes(
-      bytes: image.planes.first.bytes,
+      bytes: Platform.isAndroid ? _buildNV21Bytes(image) : image.planes.first.bytes,
       width: image.width,
       height: image.height,
       rotation: rotation,
