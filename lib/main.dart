@@ -10,13 +10,13 @@ import 'package:flutter/services.dart';
 import 'package:flutter_face_mesh/flutter_face_mesh.dart' as ffm;
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
-import 'package:permission_handler/permission_handler.dart'; // FIX #6
+import 'package:permission_handler/permission_handler.dart';
 import 'package:tflite_flutter/tflite_flutter.dart' as tfl;
 
 import 'utils.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Minimal logger — zero-cost in release builds.
+// Logger — zero-cost in release builds.
 // ─────────────────────────────────────────────────────────────────────────────
 abstract final class _Log {
   static void d(String msg) {
@@ -28,7 +28,7 @@ abstract final class _Log {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Plain-data container for CameraImage so it can cross an Isolate boundary.
+// CameraImage container — plain data so it can cross an isolate boundary.
 // ─────────────────────────────────────────────────────────────────────────────
 class _RawCameraFrame {
   const _RawCameraFrame({
@@ -66,24 +66,35 @@ class _RawCameraFrame {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Background isolate entry – must be a top-level function.
+// Isolate helper — wraps args for compute() so we don't need a global function
+// with multiple parameters.
 // ─────────────────────────────────────────────────────────────────────────────
-img.Image convertFrameInBackground(_RawCameraFrame frame) {
-  final img.Image raw = frame.isIOS ? _decodeBGRA8888(frame) : _decodeYUV(frame);
-  return frame.isFront
+class _ConvertArgs {
+  const _ConvertArgs({required this.frame, required this.isFront});
+  final _RawCameraFrame frame;
+  final bool isFront;
+}
+
+// Top-level — required by compute().
+img.Image _convertFrameIsolate(_ConvertArgs args) {
+  final img.Image raw = args.frame.isIOS
+      ? _decodeBGRA8888(args.frame)
+      : _decodeYUV(args.frame);
+  return args.isFront
       ? img.copyRotate(raw, angle: -90)
       : img.copyRotate(raw, angle: 90);
 }
 
+// ── Image decoders — top-level so the isolate can reach them ─────────────────
+
 img.Image _decodeBGRA8888(_RawCameraFrame frame) {
   final result = img.Image(width: frame.width, height: frame.height);
-  final bytes = frame.planesBytes[0];
-  final bpr = frame.planesBytesPerRow[0];
-
+  final bytes  = frame.planesBytes[0];
+  final bpr    = frame.planesBytesPerRow[0];
   for (int y = 0; y < frame.height; y++) {
     for (int x = 0; x < frame.width; x++) {
-      final offset = y * bpr + x * 4;
-      result.setPixelRgba(x, y, bytes[offset + 2], bytes[offset + 1], bytes[offset], 255);
+      final o = y * bpr + x * 4;
+      result.setPixelRgba(x, y, bytes[o + 2], bytes[o + 1], bytes[o], 255);
     }
   }
   return result;
@@ -99,42 +110,38 @@ img.Image _decodeYUV(_RawCameraFrame frame) {
     final ySize = w * h;
     for (int y = 0; y < h; y++) {
       for (int x = 0; x < w; x++) {
-        final yp = bytes[y * w + x] & 0xFF;
+        final yp    = bytes[y * w + x] & 0xFF;
         final vuIdx = ySize + (y ~/ 2) * w + (x & ~1);
-        final vp = bytes[vuIdx] & 0xFF;
-        final up = bytes[vuIdx + 1] & 0xFF;
-        result.setPixelRgba(
-          x, y,
+        final vp    = bytes[vuIdx] & 0xFF;
+        final up    = bytes[vuIdx + 1] & 0xFF;
+        result.setPixelRgba(x, y,
           (yp + (vp - 128) * 1436 / 1024).round().clamp(0, 255),
           (yp - (up - 128) * 46549 / 131072 - (vp - 128) * 93604 / 131072).round().clamp(0, 255),
           (yp + (up - 128) * 1814 / 1024).round().clamp(0, 255),
-          255,
-        );
+          255);
       }
     }
     return result;
   }
 
-  final yBytes  = frame.planesBytes[0];
-  final uBytes  = frame.planesBytes[1];
-  final vBytes  = frame.planesBytes[2];
-  final yRowStride  = frame.planesBytesPerRow[0];
-  final uvRowStride = frame.planesBytesPerRow[1];
+  final yBytes        = frame.planesBytes[0];
+  final uBytes        = frame.planesBytes[1];
+  final vBytes        = frame.planesBytes[2];
+  final yRowStride    = frame.planesBytesPerRow[0];
+  final uvRowStride   = frame.planesBytesPerRow[1];
   final uvPixelStride = frame.planesBytesPerPixel[1] ?? 1;
 
   for (int y = 0; y < h; y++) {
     for (int x = 0; x < w; x++) {
-      final yp = yBytes[y * yRowStride + x] & 0xFF;
+      final yp    = yBytes[y * yRowStride + x] & 0xFF;
       final uvIdx = uvPixelStride * (x ~/ 2) + uvRowStride * (y ~/ 2);
-      final up = uBytes[uvIdx] & 0xFF;
-      final vp = vBytes[uvIdx] & 0xFF;
-      result.setPixelRgba(
-        x, y,
+      final up    = uBytes[uvIdx] & 0xFF;
+      final vp    = vBytes[uvIdx] & 0xFF;
+      result.setPixelRgba(x, y,
         (yp + (vp - 128) * 1436 / 1024).round().clamp(0, 255),
         (yp - (up - 128) * 46549 / 131072 - (vp - 128) * 93604 / 131072).round().clamp(0, 255),
         (yp + (up - 128) * 1814 / 1024).round().clamp(0, 255),
-        255,
-      );
+        255);
     }
   }
   return result;
@@ -178,32 +185,42 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
     DeviceOrientation.landscapeRight: 270,
   };
 
-  static const int _frameIntervalMs = 40; // ~25 fps target
+  // ── Removed: static const int _frameIntervalMs = 40
+  //    The 40 ms artificial gate is gone. The _isDetecting bool already
+  //    prevents pipeline overlap — no extra throttle needed.
   static const int _maxConsecutiveSkips = 3;
+
+  // Recognition fires every N detection frames so labels update ~6×/sec
+  // without blocking the fast bounding-box track.
+  static const int _recognitionEveryNFrames = 5;
 
   CameraController? _cameraController;
   List<CameraDescription> _cameras = [];
   CameraLensDirection _direction = CameraLensDirection.front;
 
   ffm.FaceDetector? _faceDetector;
-  tfl.Interpreter? _interpreter;
+  tfl.Interpreter?  _interpreter;
 
   Directory? _appDir;
-  File? _jsonFile;
+  File?      _jsonFile;
 
   final TextEditingController _nameController = TextEditingController();
 
-  bool _isDetecting = false;
-  bool _faceFound = false;
-  bool _busy = false;
+  bool _isDetecting   = false;
+  bool _isRecognizing = false;
+  bool _faceFound     = false;
+  bool _busy          = false;
 
-  int _lastFrameMs = 0;
-  int _lastPipelineMs = 0;
-  int _skipsRemaining = 0;
+  int _lastPipelineMs  = 0;
+  int _skipsRemaining  = 0;
+  int _framesSinceReco = 0; // counts detection frames between recognition runs
 
-  Map<String, List<ffm.Face>> _scanResults = {};
-  Map<String, List<double>> _savedEmbeddings = {};
-  List<double>? _currentEmbedding;
+  // _scanResults drives the painter.
+  // Bounding-box positions update every detection frame (Track 1).
+  // Labels update every _recognitionEveryNFrames frames (Track 2).
+  Map<String, List<ffm.Face>> _scanResults    = {};
+  Map<String, List<double>>   _savedEmbeddings = {};
+  List<double>?                _currentEmbedding;
 
   double threshold = 1.0;
 
@@ -218,19 +235,14 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
   }
 
   Future<void> _initialize() async {
-    // ── FIX #6: Request CAMERA permission before doing anything. ─────────────
-    // On Android 6.0+ and iOS, the user must grant this at runtime.
-    // The camera plugin will NOT request it automatically.
-    final cameraStatus = await Permission.camera.request();
-    if (!cameraStatus.isGranted) {
-      _Log.d('Camera permission denied — aborting initialization');
+    final status = await Permission.camera.request();
+    if (!status.isGranted) {
+      _Log.d('Camera permission denied');
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Camera permission is required for face recognition.'),
-            duration: Duration(seconds: 4),
-          ),
-        );
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Camera permission is required.'),
+          duration: Duration(seconds: 4),
+        ));
       }
       return;
     }
@@ -240,13 +252,6 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
       if (_cameras.isEmpty) throw Exception('No cameras found.');
 
       _faceDetector = ffm.FaceDetector();
-
-      // ── FIX #4 (Dart side): Pass the plugin-namespaced asset key so the
-      //    Kotlin plugin resolves it correctly in the plugin's asset namespace.
-      //    Without this, the fallback path in the plugin uses the two-arg
-      //    getAssetFilePathByName() which is already fixed on the Kotlin side,
-      //    so calling initialize() without arguments also now works correctly.
-      //    Either form below is fine — keeping explicit for clarity:
       await _faceDetector!.initialize(
         modelAsset: 'packages/flutter_face_mesh/assets/face_landmarker.task',
         maxFaces: 5,
@@ -258,7 +263,7 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
         _Log.d('Model load error (recognition disabled): $e');
       }
 
-      _appDir = await getApplicationDocumentsDirectory();
+      _appDir   = await getApplicationDocumentsDirectory();
       _jsonFile = File('${_appDir!.path}/emb.json');
       await _loadSavedFaces();
       await _startCamera();
@@ -270,17 +275,11 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
 
   Future<void> _loadModel() async {
     _interpreter?.close();
-
     final options = tfl.InterpreterOptions();
-
     if (Platform.isAndroid) {
-      try {
-        options.addDelegate(tfl.XNNPackDelegate());
-      } catch (e) {
-        _Log.d('XNNPack delegate unavailable, using CPU: $e');
-      }
+      try { options.addDelegate(tfl.XNNPackDelegate()); }
+      catch (e) { _Log.d('XNNPack unavailable: $e'); }
     }
-
     _interpreter = await tfl.Interpreter.fromAsset(
       'assets/mobilefacenet.tflite',
       options: options,
@@ -288,15 +287,9 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
   }
 
   Future<void> _loadSavedFaces() async {
-    if (_jsonFile == null || !_jsonFile!.existsSync()) {
-      _savedEmbeddings = {};
-      return;
-    }
+    if (_jsonFile == null || !_jsonFile!.existsSync()) { _savedEmbeddings = {}; return; }
     final raw = await _jsonFile!.readAsString();
-    if (raw.trim().isEmpty) {
-      _savedEmbeddings = {};
-      return;
-    }
+    if (raw.trim().isEmpty) { _savedEmbeddings = {}; return; }
     final decoded = json.decode(raw) as Map<String, dynamic>;
     _savedEmbeddings = {
       for (final e in decoded.entries)
@@ -313,10 +306,9 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
         (c) => c.lensDirection == _direction,
         orElse: () => _cameras.first,
       );
-
       await _stopCamera();
 
-      final newController = CameraController(
+      final ctrl = CameraController(
         camera,
         ResolutionPreset.high,
         enableAudio: false,
@@ -324,11 +316,9 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
             ? ImageFormatGroup.nv21
             : ImageFormatGroup.bgra8888,
       );
-
-      _cameraController = newController;
-      await newController.initialize();
-      await newController.startImageStream(_processCameraImage);
-
+      _cameraController = ctrl;
+      await ctrl.initialize();
+      await ctrl.startImageStream(_processCameraImage);
       if (mounted) setState(() {});
     } catch (e) {
       _Log.d('Camera start error: $e');
@@ -340,254 +330,277 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
   Future<void> _stopCamera() async {
     final ctrl = _cameraController;
     if (ctrl == null) return;
-
     _cameraController = null;
     if (mounted) setState(() {});
-
-    try {
-      if (ctrl.value.isStreamingImages) await ctrl.stopImageStream();
-    } catch (e) {
-      _Log.d('Error stopping image stream: $e');
-    }
-    try {
-      await ctrl.dispose();
-    } catch (e) {
-      _Log.d('Error disposing camera: $e');
-    }
+    try { if (ctrl.value.isStreamingImages) await ctrl.stopImageStream(); } catch (_) {}
+    try { await ctrl.dispose(); } catch (_) {}
   }
 
+  // ── FRAME GATE ────────────────────────────────────────────────────────────
+  //
+  // Only guard: never overlap pipeline runs.
+  // The old 40 ms time gate is gone — bounding boxes now update at full
+  // camera framerate (~30 fps on most devices).
+  //
   void _processCameraImage(CameraImage image) {
     if (_isDetecting || _faceDetector == null) return;
-
-    if (_skipsRemaining > 0) {
-      _skipsRemaining--;
-      return;
-    }
-
-    final nowMs = DateTime.now().millisecondsSinceEpoch;
-    if (nowMs - _lastFrameMs < _frameIntervalMs) return;
+    if (_skipsRemaining > 0) { _skipsRemaining--; return; }
 
     final ctrl = _cameraController;
     if (ctrl == null) return;
 
-    _lastFrameMs = nowMs;
     _isDetecting = true;
+    _framesSinceReco++;
 
-    final directionAtCapture = _direction;
-    _analyzeImage(image, directionAtCapture, ctrl).whenComplete(() {
+    final dir = _direction;
+    _detectFaces(image, dir, ctrl).whenComplete(() {
       _isDetecting = false;
-      if (_lastPipelineMs > _frameIntervalMs * 1.5) {
-        _skipsRemaining = ((_lastPipelineMs / _frameIntervalMs).floor() - 1)
-            .clamp(0, _maxConsecutiveSkips);
-      } else {
-        _skipsRemaining = 0;
-      }
+      // Adaptive skips: pause extra frames only if detection itself was slow.
+      _skipsRemaining = _lastPipelineMs > 80
+          ? ((_lastPipelineMs / 40).floor() - 1).clamp(0, _maxConsecutiveSkips)
+          : 0;
     });
   }
 
-  Future<void> _analyzeImage(
+  // ── TRACK 1: DETECTION (every frame, fast) ────────────────────────────────
+  //
+  // Sends bytes → MediaPipe → updates bounding boxes immediately.
+  // Does NOT convert frames or run TFLite. Typically <15 ms.
+  //
+  Future<void> _detectFaces(
     CameraImage image,
     CameraLensDirection direction,
     CameraController controller,
   ) async {
-    final totalSw = kDebugMode ? (Stopwatch()..start()) : null;
+    final sw = kDebugMode ? (Stopwatch()..start()) : null;
 
-    final int rotation = _calculateRotation(controller);
-
-    // ── FIX #5: Build the full NV21 byte array from all planes. ─────────────
-    // On Android, image.planes[0] is ONLY the Y-plane (~width×height bytes).
-    // NV21 requires Y-plane + interleaved VU half-resolution plane concatenated.
-    // Passing only planes[0] to nv21ToBitmap() results in corrupted output
-    // (YuvImage throws an ArrayIndexOutOfBoundsException or silent garbage).
-    final Uint8List detectionBytes = Platform.isAndroid
+    final int     rotation = _calculateRotation(controller);
+    final Uint8List bytes  = Platform.isAndroid
         ? _buildNV21Bytes(image)
         : image.planes.first.bytes;
+    final String format    = Platform.isAndroid ? 'nv21' : 'jpeg';
 
-    final String format = Platform.isAndroid ? 'nv21' : 'jpeg';
-
-    final detectionSw = kDebugMode ? (Stopwatch()..start()) : null;
-
-    final ffm.FaceResult faceResult = await _faceDetector!.detectFromBytes(
-      bytes: detectionBytes, // FIX: full NV21 data
+    final ffm.FaceResult result = await _faceDetector!.detectFromBytes(
+      bytes: bytes,
       width: image.width,
       height: image.height,
       rotation: rotation,
       format: format,
     );
-    final faces = faceResult.faces;
-    detectionSw?.stop();
+    final List<ffm.Face> faces = result.faces;
 
+    // ── No faces: clear everything ────────────────────────────────────────
     if (faces.isEmpty) {
       if (_faceFound || _scanResults.isNotEmpty) {
-        if (mounted) {
-          setState(() {
-            _faceFound = false;
-            _scanResults = {};
-            _currentEmbedding = null;
-          });
-        }
+        if (mounted) setState(() {
+          _faceFound        = false;
+          _scanResults      = {};
+          _currentEmbedding = null;
+          _framesSinceReco  = 0;
+        });
       }
-      if (kDebugMode) _lastPipelineMs = totalSw!.elapsedMilliseconds;
+      if (kDebugMode) _lastPipelineMs = sw!.elapsedMilliseconds;
       return;
     }
 
-    final conversionSw = kDebugMode ? (Stopwatch()..start()) : null;
-    final frame = _RawCameraFrame.fromCameraImage(image, direction);
-    final convertedImage = await compute(convertFrameInBackground, frame);
-    conversionSw?.stop();
-
-    final recognitionSw = kDebugMode ? (Stopwatch()..start()) : null;
-    final Map<String, List<ffm.Face>> finalResults = {};
-
-    for (final face in faces) {
-      final pixelRect = face.boundingBox.toRect(
-        Size(convertedImage.width.toDouble(), convertedImage.height.toDouble()),
-      );
-      final safeRect = _expandedRect(pixelRect, convertedImage.width, convertedImage.height);
-
-      final cropped = img.copyCrop(
-        convertedImage,
-        x: safeRect.left.round(),
-        y: safeRect.top.round(),
-        width: safeRect.width.round(),
-        height: safeRect.height.round(),
-      );
-      final resized = img.copyResize(cropped, width: 112, height: 112);
-      final label = _recognize(resized);
-      finalResults.putIfAbsent(label, () => []).add(face);
-    }
-    recognitionSw?.stop();
-    totalSw?.stop();
-
-    if (kDebugMode) {
-      _lastPipelineMs = totalSw!.elapsedMilliseconds;
-      _Log.d(
-        'detect: ${detectionSw!.elapsedMilliseconds}ms | '
-        'convert: ${conversionSw!.elapsedMilliseconds}ms | '
-        'recognize: ${recognitionSw!.elapsedMilliseconds}ms | '
-        'total: $_lastPipelineMs ms',
-      );
-    }
-
+    // ── Faces found: update bounding boxes immediately ────────────────────
+    //
+    // Key insight: we update positions every frame but keep the previous
+    // labels. The box jumps to the new position instantly; the label stays
+    // stable until the next recognition run completes.
+    //
     if (mounted) {
-      final didChange = !_mapsEqual(_scanResults, finalResults);
-      if (!_faceFound || didChange) {
+      setState(() {
+        _faceFound = true;
+
+        // Rebuild _scanResults preserving existing label → face associations
+        // but with the new bounding-box positions from this frame.
+        final oldLabels  = _scanResults.keys.toList();
+        final newResults = <String, List<ffm.Face>>{};
+        for (int i = 0; i < faces.length; i++) {
+          // Reuse the label from the same index position if it exists,
+          // otherwise show '...' until recognition assigns a real label.
+          final label = (i < oldLabels.length) ? oldLabels[i] : '...';
+          newResults.putIfAbsent(label, () => []).add(faces[i]);
+        }
+        _scanResults = newResults;
+      });
+    }
+
+    // ── TRACK 2: kick off recognition every N frames ──────────────────────
+    //
+    // _isRecognizing prevents stacking multiple recognition jobs.
+    // The frame + face list are snapshotted here before the async gap.
+    //
+    if (_framesSinceReco >= _recognitionEveryNFrames && !_isRecognizing) {
+      _framesSinceReco = 0;
+      _isRecognizing   = true;
+
+      // Snapshot everything we need — these will be invalid after await.
+      final frameSnap = _RawCameraFrame.fromCameraImage(image, direction);
+      final facesSnap = List<ffm.Face>.from(faces);
+      final embSnap   = Map<String, List<double>>.from(_savedEmbeddings);
+
+      _runRecognition(frameSnap, facesSnap, embSnap, direction)
+          .whenComplete(() => _isRecognizing = false);
+    }
+
+    if (kDebugMode) _lastPipelineMs = sw!.elapsedMilliseconds;
+  }
+
+  // ── TRACK 2: RECOGNITION ─────────────────────────────────────────────────
+  //
+  // Step A — frame conversion runs on a background isolate (heavy pixel work).
+  // Step B — TFLite inference runs on the main isolate (Interpreter is not
+  //           isolate-safe; XNNPack delegate is typically <5 ms per face).
+  // Step C — setState updates labels only, bounding boxes are already live.
+  //
+  Future<void> _runRecognition(
+    _RawCameraFrame frame,
+    List<ffm.Face> faces,
+    Map<String, List<double>> savedEmbeddings,
+    CameraLensDirection direction,
+  ) async {
+    if (_interpreter == null) return;
+
+    try {
+      // Step A: convert on background isolate.
+      final img.Image converted = await compute(
+        _convertFrameIsolate,
+        _ConvertArgs(
+          frame: frame,
+          isFront: direction == CameraLensDirection.front,
+        ),
+      );
+
+      // Step B: crop + TFLite per face (main isolate, fast with XNNPack).
+      final Map<String, List<ffm.Face>> labelledResults = {};
+      List<double>? firstEmbedding;
+
+      for (final face in faces) {
+        final pixelRect = face.boundingBox.toRect(
+          Size(converted.width.toDouble(), converted.height.toDouble()),
+        );
+        final safeRect = _expandedRect(pixelRect, converted.width, converted.height);
+
+        final img.Image cropped = img.copyCrop(
+          converted,
+          x: safeRect.left.round(),
+          y: safeRect.top.round(),
+          width: safeRect.width.round(),
+          height: safeRect.height.round(),
+        );
+        final img.Image resized = img.copyResize(cropped, width: 112, height: 112);
+
+        final String label = _recognize(resized);
+        firstEmbedding ??= _currentEmbedding;
+        labelledResults.putIfAbsent(label, () => []).add(face);
+      }
+
+      // Step C: update labels — boxes are already on screen from Track 1.
+      if (mounted) {
         setState(() {
-          _faceFound = true;
-          _scanResults = finalResults;
+          _scanResults      = labelledResults;
+          _currentEmbedding = firstEmbedding;
         });
       }
+    } catch (e) {
+      _Log.d('Recognition error: $e');
     }
   }
 
-  // ── FIX #5: Correctly combine camera image planes into a single NV21 buffer.
-  //
-  // NV21 layout expected by Android's YuvImage:
-  //   [ Y-plane: width×height bytes ][ VU-plane: width×height/2 bytes ]
-  //
-  // The camera plugin on Android with ImageFormatGroup.nv21 may return:
-  //   • 1 plane  → already fully packed NV21 (pass through)
-  //   • 2 planes → planes[0]=Y, planes[1]=VU interleaved (concatenate)
-  //   • 3 planes → planes[0]=Y, planes[1]=U, planes[2]=V (rare; requires interleave)
-  static Uint8List _buildNV21Bytes(CameraImage image) {
-    if (image.planes.length == 1) {
-      // Already packed NV21.
-      return image.planes[0].bytes;
-    }
-    if (image.planes.length == 2) {
-      // Y + interleaved VU — concatenate directly.
-      final y  = image.planes[0].bytes;
-      final vu = image.planes[1].bytes;
-      final nv21 = Uint8List(y.length + vu.length);
-      nv21.setRange(0, y.length, y);
-      nv21.setRange(y.length, nv21.length, vu);
-      return nv21;
-    }
-    // 3-plane YUV420: interleave U and V planes into a VU plane.
-    final y = image.planes[0].bytes;
-    final u = image.planes[1].bytes;
-    final v = image.planes[2].bytes;
-    final uvLen = image.width * image.height ~/ 2;
-    final nv21 = Uint8List(y.length + uvLen);
-    nv21.setRange(0, y.length, y);
-    // Interleave V then U (NV21 order).
-    final uvPixelStride = image.planes[1].bytesPerPixel ?? 1;
-    final uvRowStride   = image.planes[1].bytesPerRow;
-    int dstIdx = y.length;
-    for (int row = 0; row < image.height ~/ 2; row++) {
-      for (int col = 0; col < image.width ~/ 2; col++) {
-        final srcIdx = row * uvRowStride + col * uvPixelStride;
-        nv21[dstIdx++] = v[srcIdx];
-        nv21[dstIdx++] = u[srcIdx];
-      }
-    }
-    return nv21;
-  }
-
-  bool _mapsEqual(
-    Map<String, List<ffm.Face>> a,
-    Map<String, List<ffm.Face>> b,
-  ) {
-    if (a.length != b.length) return false;
-    for (final key in a.keys) {
-      if (!b.containsKey(key)) return false;
-      if (a[key]!.length != b[key]!.length) return false;
-    }
-    return true;
-  }
-
-  int _calculateRotation(CameraController controller) {
-    final camera = controller.description;
-    final sensorOrientation = camera.sensorOrientation;
-    final comp = _orientations[controller.value.deviceOrientation] ?? 0;
-    return camera.lensDirection == CameraLensDirection.front
-        ? (sensorOrientation + comp) % 360
-        : (sensorOrientation - comp + 360) % 360;
-  }
+  // ── TFLite inference (main isolate only) ─────────────────────────────────
 
   String _recognize(img.Image faceImage) {
     if (_interpreter == null) return 'Model not loaded';
-
-    final input = imageToByteListFloat32(faceImage, 112, 128, 128);
-    final inputReshaped = input.reshape([1, 112, 112, 3]);
+    final input  = imageToByteListFloat32(faceImage, 112, 128, 128);
+    final shaped = input.reshape([1, 112, 112, 3]);
     final output = [List<double>.filled(192, 0.0)];
-
-    _interpreter!.run(inputReshaped, output);
-
-    final embedding = List<double>.from(output.first);
+    _interpreter!.run(shaped, output);
+    final embedding   = List<double>.from(output.first);
     _currentEmbedding = embedding;
     return _compare(embedding).toUpperCase();
   }
 
   String _compare(List<double> curr) {
     if (_savedEmbeddings.isEmpty) return 'NO FACE SAVED';
-
     double minDist = 999.0;
-    String result = 'NOT RECOGNIZED';
-
+    String result  = 'NOT RECOGNIZED';
     for (final entry in _savedEmbeddings.entries) {
       final dist = euclideanDistance(entry.value, curr);
       if (dist <= threshold && dist < minDist) {
         minDist = dist;
-        result = entry.key;
+        result  = entry.key;
       }
     }
     return result;
   }
 
-  Future<void> _toggleCameraDirection() async {
-    if (mounted) {
-      setState(() {
-        _direction = _direction == CameraLensDirection.back
-            ? CameraLensDirection.front
-            : CameraLensDirection.back;
-      });
+  // ── NV21 builder ─────────────────────────────────────────────────────────
+
+  static Uint8List _buildNV21Bytes(CameraImage image) {
+    if (image.planes.length == 1) return image.planes[0].bytes;
+    if (image.planes.length == 2) {
+      final y  = image.planes[0].bytes;
+      final vu = image.planes[1].bytes;
+      final out = Uint8List(y.length + vu.length);
+      out.setRange(0, y.length, y);
+      out.setRange(y.length, out.length, vu);
+      return out;
     }
+    final y  = image.planes[0].bytes;
+    final u  = image.planes[1].bytes;
+    final v  = image.planes[2].bytes;
+    final uvLen = image.width * image.height ~/ 2;
+    final out   = Uint8List(y.length + uvLen);
+    out.setRange(0, y.length, y);
+    final uvPixelStride = image.planes[1].bytesPerPixel ?? 1;
+    final uvRowStride   = image.planes[1].bytesPerRow;
+    int dst = y.length;
+    for (int row = 0; row < image.height ~/ 2; row++) {
+      for (int col = 0; col < image.width ~/ 2; col++) {
+        final src = row * uvRowStride + col * uvPixelStride;
+        out[dst++] = v[src];
+        out[dst++] = u[src];
+      }
+    }
+    return out;
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  int _calculateRotation(CameraController controller) {
+    final camera            = controller.description;
+    final sensorOrientation = camera.sensorOrientation;
+    final comp              = _orientations[controller.value.deviceOrientation] ?? 0;
+    return camera.lensDirection == CameraLensDirection.front
+        ? (sensorOrientation + comp) % 360
+        : (sensorOrientation - comp + 360) % 360;
+  }
+
+  Rect _expandedRect(Rect box, int imgW, int imgH) {
+    const padding = 10.0;
+    return Rect.fromLTRB(
+      max(0, box.left - padding),
+      max(0, box.top - padding),
+      min(imgW.toDouble(), box.right + padding),
+      min(imgH.toDouble(), box.bottom + padding),
+    );
+  }
+
+  // ── Camera controls ───────────────────────────────────────────────────────
+
+  Future<void> _toggleCameraDirection() async {
+    if (mounted) setState(() {
+      _direction = _direction == CameraLensDirection.back
+          ? CameraLensDirection.front
+          : CameraLensDirection.back;
+    });
     await _startCamera();
   }
 
   Future<void> _resetFile() async {
-    _savedEmbeddings = {};
+    _savedEmbeddings  = {};
     _currentEmbedding = null;
     if (_jsonFile != null && _jsonFile!.existsSync()) await _jsonFile!.delete();
     if (mounted) setState(() {});
@@ -596,10 +609,9 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
   Future<void> _viewLabels() async {
     await _stopCamera();
     if (!mounted) return;
-
     await showDialog<void>(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (ctx) => AlertDialog(
         title: const Text('Saved Faces'),
         content: SizedBox(
           width: double.maxFinite,
@@ -609,18 +621,15 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
               : ListView.separated(
                   itemCount: _savedEmbeddings.length,
                   separatorBuilder: (_, __) => const Divider(height: 1),
-                  itemBuilder: (_, index) => ListTile(
+                  itemBuilder: (_, i) => ListTile(
                     dense: true,
-                    title: Text(_savedEmbeddings.keys.elementAt(index)),
+                    title: Text(_savedEmbeddings.keys.elementAt(i)),
                   ),
                 ),
         ),
         actions: [
           TextButton(
-            onPressed: () async {
-              Navigator.pop(context);
-              await _startCamera();
-            },
+            onPressed: () async { Navigator.pop(ctx); await _startCamera(); },
             child: const Text('OK'),
           ),
         ],
@@ -632,25 +641,22 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
     if (_currentEmbedding == null) return;
     await _stopCamera();
     if (!mounted) return;
-
     await showDialog<void>(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (ctx) => AlertDialog(
         title: const Text('Add Face'),
-        content: Row(
-          children: [
-            Expanded(
-              child: TextField(
-                controller: _nameController,
-                autofocus: true,
-                decoration: const InputDecoration(
-                  labelText: 'Name',
-                  icon: Icon(Icons.face),
-                ),
+        content: Row(children: [
+          Expanded(
+            child: TextField(
+              controller: _nameController,
+              autofocus: true,
+              decoration: const InputDecoration(
+                labelText: 'Name',
+                icon: Icon(Icons.face),
               ),
             ),
-          ],
-        ),
+          ),
+        ]),
         actions: [
           TextButton(
             onPressed: () async {
@@ -660,7 +666,7 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
                 await _saveEmbeddings();
               }
               _nameController.clear();
-              if (mounted) Navigator.pop(context);
+              if (mounted) Navigator.pop(ctx);
               await _startCamera();
             },
             child: const Text('Save'),
@@ -668,7 +674,7 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
           TextButton(
             onPressed: () async {
               _nameController.clear();
-              if (mounted) Navigator.pop(context);
+              if (mounted) Navigator.pop(ctx);
               await _startCamera();
             },
             child: const Text('Cancel'),
@@ -684,16 +690,6 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
     if (mounted) setState(() {});
   }
 
-  Rect _expandedRect(Rect box, int imgW, int imgH) {
-    const padding = 10.0;
-    return Rect.fromLTRB(
-      max(0, box.left - padding),
-      max(0, box.top - padding),
-      min(imgW.toDouble(), box.right + padding),
-      min(imgH.toDouble(), box.bottom + padding),
-    );
-  }
-
   // ── UI ────────────────────────────────────────────────────────────────────
 
   Widget _buildResults() {
@@ -702,10 +698,8 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
         !_cameraController!.value.isInitialized) {
       return const SizedBox.shrink();
     }
-
     final previewSize = _cameraController!.value.previewSize!;
-    final imageSize = Size(previewSize.height, previewSize.width);
-
+    final imageSize   = Size(previewSize.height, previewSize.width);
     return Positioned.fill(
       child: RepaintBoundary(
         child: CustomPaint(
@@ -750,14 +744,11 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
         actions: [
           PopupMenuButton<Choice>(
             onSelected: (choice) async {
-              if (choice == Choice.delete) {
-                await _resetFile();
-              } else {
-                await _viewLabels();
-              }
+              if (choice == Choice.delete) await _resetFile();
+              else await _viewLabels();
             },
             itemBuilder: (_) => const [
-              PopupMenuItem(value: Choice.view, child: Text('View Saved Faces')),
+              PopupMenuItem(value: Choice.view,   child: Text('View Saved Faces')),
               PopupMenuItem(value: Choice.delete, child: Text('Remove all faces')),
             ],
           ),
