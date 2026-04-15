@@ -18,6 +18,8 @@ android {
         jvmTarget = JavaVersion.VERSION_17.toString()
     }
 
+    
+
     defaultConfig {
         applicationId = "com.example.face_recognition"
         minSdk = flutter.minSdkVersion

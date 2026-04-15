@@ -42,3 +42,50 @@
 
 # Ignore Java annotation warnings
 -dontwarn javax.annotation.**
+
+# ── Critical: prevent R8 from stripping attributes MediaPipe stack-walks ──────
+-keepattributes EnclosingMethod
+-keepattributes InnerClasses
+-keepattributes Signature
+-keepattributes *Annotation*
+
+# ── Google Flogger (used internally by MediaPipe) ─────────────────────────────
+-keep class com.google.common.flogger.** { *; }
+-keep interface com.google.common.flogger.** { *; }
+-keepclassmembers class com.google.common.flogger.** { *; }
+
+# ── Google Guava (Flogger depends on this) ────────────────────────────────────
+-keep class com.google.common.** { *; }
+-keepclassmembers class com.google.common.** { *; }
+
+# ── Prevent inlining ONLY for classes Flogger/MediaPipe stack-walks ───────────
+# This replaces -dontoptimize (which slows the whole app)
+-keepclassmembers,allowshrinking,allowobfuscation class * {
+    @com.google.common.flogger.* <methods>;
+}
+-keep,allowshrinking,allowobfuscation class * extends com.google.common.flogger.AbstractLogger {
+    <methods>;
+}
+# Tell R8 not to inline across MediaPipe's graph loading boundary
+-keepclasseswithmembernames class com.google.mediapipe.framework.Graph {
+    *;
+}
+
+# ── Protobuf (used internally by MediaPipe) ───────────────────────────────────
+-keep class com.google.protobuf.** { *; }
+-keep interface com.google.protobuf.** { *; }
+-keep enum com.google.protobuf.** { *; }
+-keepclassmembers class * extends com.google.protobuf.GeneratedMessageLite {
+    <fields>;
+}
+-keepclassmembers class * extends com.google.protobuf.GeneratedMessageV3 {
+    <fields>;
+}
+# Prevent R8 from renaming protobuf fields accessed by reflection
+-keepclassmembers class com.google.protobuf.Any {
+    private <fields>;
+    public <fields>;
+}
+-keepclassmembers class * implements com.google.protobuf.MessageLite {
+    private <fields>;
+}
